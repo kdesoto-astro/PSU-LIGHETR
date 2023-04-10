@@ -4,9 +4,16 @@ import matplotlib.pyplot as plt
 import os, glob, sys
 from os import listdir, makedirs
 from os.path import isfile, join
+
+from astropy.io import fits
+from astropy.table import Table, hstack
+from scipy.optimize import curve_fit
+
 np.set_printoptions(threshold=sys.maxsize)
 H_0 = 70. # km/s/Mpc
 c = 3e5 # km/s
+
+HETDEX_SPECS_FN = "refined_hetdex_spec.fits"
 
 def get_all_spec_files(fn_dir):
     """
@@ -15,7 +22,7 @@ def get_all_spec_files(fn_dir):
     """
     return [join(fn_dir, f) for f in listdir(fn_dir) if (('spec' in f) & isfile(join(fn_dir, f)))]
 
-def import_kn_spec_file(fn, t_lim=1e5):
+def import_kn_spec_file(fn, t_lim=1e5, keep_frac=0.001):
     """
     Imports LIGO spectral file, with (t, viewing angle) pair
     as key and [wavelength arr, spectral arr] as values.
@@ -38,6 +45,8 @@ def import_kn_spec_file(fn, t_lim=1e5):
         wv_right = data[t_idx, 1:, 1]
         wv_center = (wv_left + wv_right) / 2.
         for angle in np.arange(2, np.shape(data)[-1],dtype=int):
+            if np.random.rand() > keep_frac:
+                continue
             # flux is at at R=10pc [erg/(s*Angstrom*cm)]
             data_dict[(t, angle)] = np.vstack([wv_center, data[t_idx,1:,angle]])
             #print(data_dict[(t, angle)])
@@ -67,16 +76,17 @@ def redshift_spectrum(wavelengths, spectrum, \
     scaled_flux = scaled_lum / (1. + redshift_new) / calc_distance(redshift_new)**2
     return shifted_wv, scaled_flux
 
-def combine_kilonova_galaxy_spectrum(k_wv, k_fluxes, g_wv, g_fluxes_multi, g_z_multi):
+def combine_kilonova_galaxy_spectrum(k_wv, k_fluxes, g_wv, g_fluxes_multi, g_z_multi, num=2):
     """
     Combine a galaxy and kilonova spectrum so that the redshifts align.
-    Shifts to the galactic redshift.
+    Shifts to the galactic redshift. Applies corrections for multiple galaxies at once.
     """
     interped_k_fluxes = []
-    for i in range(len(g_z_multi)):
+    idxs = np.random.randint(0,len(g_z_multi),num)
+    for i in idxs:
         k_wv_shifted, k_flux_shifted = redshift_spectrum(k_wv, k_fluxes, g_z_multi[i])
         interped_k_fluxes.append(np.interp(g_wv, k_wv_shifted, k_flux_shifted))
-    return g_wv, np.array(interped_k_fluxes) + g_fluxes_multi
+    return g_wv, np.array(interped_k_fluxes) + g_fluxes_multi[idxs]
 
 def import_gal_file_npy(fn):
     """
@@ -85,6 +95,56 @@ def import_gal_file_npy(fn):
     npy_array = np.load(fn)
     return npy_array[0], npy_array[1], npy_array[2:20]
 
+def refine_gal_specs(fn):
+    """
+    Import HETDEX spectral file. Returns wavelengths, spectra, and redshifts.
+    """
+    hdu = fits.open(fn)
+    spec = hdu['SPEC'].data
+    spec_err = hdu['SPEC_ERR'].data
+    wave_rect = hdu['WAVELENGTH'].data
+    z = np.array([x[7] for x in hdu['INFO'].data])
+    
+    w_z = ( z > 0.) & (z < 0.05)
+    
+    c1 = fits.Column(name='z', array=z[w_z], format='E')
+    c2 = fits.Column(name='wv', array=wave_rect, format='E')
+    c3 = fits.Column(name='flux', array=spec[w_z], format='1036E')
+    
+    coldefs = fits.ColDefs([c1, c2, c3])
+    hdu = fits.BinTableHDU.from_columns(coldefs)
+    hdu.writeto('refined_hetdex_spec.fits')
+    
+    return z[w_z], wave_rect, spec[w_z]
+
+def import_gal_specs(fn):
+    hdu = fits.open(fn)
+    data = hdu[1].data
+    z = data['z']
+    wv = data['wv']
+    spec = data['flux']
+    wv_shape = spec.shape[-1]
+    return z, wv[:wv_shape], spec
+
+def plot_redshifts(z):
+    """
+    Plot redshift distribution of sample. Overplots
+    expected 1/(1+z)^3 trend
+    """
+    def z_curve_fit(z_arr, A):
+        return A * (1+z_arr)**3
+    
+    n, bin_edges, _ = plt.hist(z, bins=50)
+    bin_centers = (bin_edges[1:] + bin_edges[:-1]) / 2.
+    popt, pcov = curve_fit(z_curve_fit, bin_centers, n)
+    plt.plot(bin_centers, z_curve_fit(bin_centers, *popt), label="Expected Trend")
+    plt.legend()
+    plt.xlabel("Redshift")
+    plt.ylabel("Count")
+    plt.title("HETDEX Galaxy Distribution")
+    plt.savefig("figs/z_dist_hetdex.pdf")
+    plt.close()
+    
 def generate_samples_from_file_pair(kn_file, gal_file, out_folder, prefix):
     """
     Takes one kilonova file and one galaxy datafile and
@@ -93,7 +153,7 @@ def generate_samples_from_file_pair(kn_file, gal_file, out_folder, prefix):
     """
     makedirs(out_folder, exist_ok=True)
     kn_data_dict = import_kn_spec_file(kn_file, 2.)
-    gal_z_all, gal_wv, gal_spec_all = import_gal_file_npy(gal_file)
+    gal_z_all, gal_wv, gal_spec_all = import_gal_specs(gal_file)
     for k in kn_data_dict:
         kn_wv, kn_flux = kn_data_dict[k]
         combined_wv, combined_flux_all = combine_kilonova_galaxy_spectrum(kn_wv, kn_flux, \
@@ -116,14 +176,21 @@ def plot_training_sample(fn):
     plt.savefig("spectra/train_sample.png")
     plt.close()
     
-LIGO_DIR = "/gpfs/group/vav5084/default/ligo/kn_sim_cube_v1"
-SAVE_DIR = "/gpfs/group/vav5084/default/ligo/training_samples_v1"
-GAL_TEST_FILE = "/gpfs/group/vav5084/default/ligo/VIRUS_spectra.npy"
-#AL_Z_FILE = "kaylee_zs.npy"
-#GAL_TEST_Z = np.load(GAL_Z_FILE)[:20]
+def main():
+    LIGO_DIR = "/gpfs/group/vav5084/default/ligo/kn_sim_cube_v1"
+    SAVE_DIR = "/gpfs/group/vav5084/default/ligo/training_samples_kn_v2"
+    
+    ct = 0
+    for kn_file in glob.glob(LIGO_DIR+"/*_spec_*.dat"):
+        ct += 1
+        print(ct)
+        generate_samples_from_file_pair(kn_file, HETDEX_SPECS_FN, SAVE_DIR, ct)
+        
+    #kn_file = os.path.join(LIGO_DIR, "Run_TP_dyn_all_lanth_wind1_all_md0.001_vd0.05_mw0.001_vw0.05_spec_2020-03-19.dat")
+    
 
-#GAL_TEST_Z = np.random.uniform(0.0, 0.05, 19)
-kn_file = get_all_spec_files(LIGO_DIR)[0]
-generate_samples_from_file_pair(kn_file, GAL_TEST_FILE, SAVE_DIR, "test")
-
-#plot_training_sample(glob.glob(SAVE_DIR + "/*.npz")[0])
+if __name__ == "__main__":
+    main()
+    #z, wv, spec = import_gal_specs(HETDEX_SPECS_FN)
+    #plot_redshifts(z)
+    #plot_training_sample(test_fn)
